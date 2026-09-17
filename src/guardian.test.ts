@@ -6,9 +6,10 @@
  */
 
 import { TTLGuardian } from './guardian';
-import { GuardianConfig, LedgerKeyXdr, EntryReport, FeePayerStatus } from './types';
-import { ConsoleNotifier, Notifier } from './notifier';
+import { GuardianConfig, LedgerKeyXdr, EntryReport, FeePayerStatus, GuardianConfigSchema } from './types';
+import { Notifier } from './notifier';
 import { ledgersToDays, daysToLedgers, computeAvgCloseSeconds, FALLBACK_CLOSE_SECONDS } from './ledger';
+import * as fs from 'fs';
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -71,7 +72,7 @@ class TestGuardian extends TTLGuardian {
     this.mockCheckError = err;
   }
 
-  override async checkEntry(contractId: string, key?: LedgerKeyXdr) {
+  override async checkEntry(contractId: string, key?: LedgerKeyXdr): Promise<{ contractId: string; key: LedgerKeyXdr | undefined; ttlLedgers: number; ttlEstimatedDays: number }> {
     if (this.mockCheckError) throw this.mockCheckError;
     const mapKey = `${contractId}:${key ?? '__instance__'}`;
     const ttlLedgers = this.mockTtlLedgers.get(mapKey) ?? 100000;
@@ -80,7 +81,7 @@ class TestGuardian extends TTLGuardian {
     return { contractId, key, ttlLedgers, ttlEstimatedDays };
   }
 
-  override async extendEntry(contractId: string, key: LedgerKeyXdr | undefined, extendToDays: number) {
+  override async extendEntry(contractId: string, key: LedgerKeyXdr | undefined, extendToDays: number): Promise<{ contractId: string; key: LedgerKeyXdr | undefined; txHash: string; newTtlLedgers: number }> {
     this.extendCalls.push({ contractId, key, extendToDays });
     if (this.mockExtendError) {
       this.logger.log('extend_failure', { error: this.mockExtendError.message }, contractId, key);
@@ -308,8 +309,7 @@ describe('TTLGuardian.runOnce', () => {
     expect(report.entries[1].key).toBe('dGVzdA=='); // storage key
   });
 
-  test('extension result is logged', async () => {
-    const fs = require('fs');
+  test('extension result is logged', async (): Promise<void> => {
     const spy = new SpyNotifier();
     const logFile = '/tmp/test-extension-log-' + Date.now() + '.log';
     const guardian = new TestGuardian(makeConfig({ logFile }), spy);
@@ -358,8 +358,7 @@ describe('TTLGuardian.runOnce', () => {
 // ---------------------------------------------------------------------------
 
 describe('loadConfig validation', () => {
-  test('criticalThresholdDays must be less than warnThresholdDays', () => {
-    const { GuardianConfigSchema } = require('./types');
+  test('criticalThresholdDays must be less than warnThresholdDays', (): void => {
     const result = GuardianConfigSchema.safeParse({
       ...BASE_CONFIG,
       entries: [
@@ -374,8 +373,7 @@ describe('loadConfig validation', () => {
     expect(result.success).toBe(false);
   });
 
-  test('extendToDays must be greater than warnThresholdDays', () => {
-    const { GuardianConfigSchema } = require('./types');
+  test('extendToDays must be greater than warnThresholdDays', (): void => {
     const result = GuardianConfigSchema.safeParse({
       ...BASE_CONFIG,
       entries: [
@@ -390,8 +388,7 @@ describe('loadConfig validation', () => {
     expect(result.success).toBe(false);
   });
 
-  test('valid config parses successfully', () => {
-    const { GuardianConfigSchema } = require('./types');
+  test('valid config parses successfully', (): void => {
     const result = GuardianConfigSchema.safeParse(BASE_CONFIG);
     expect(result.success).toBe(true);
   });

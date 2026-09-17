@@ -10,7 +10,7 @@ import { SorobanRpc } from '@stellar/stellar-sdk';
  * Falls back to FALLBACK_CLOSE_SECONDS if the RPC call fails or returns insufficient data.
  */
 export const FALLBACK_CLOSE_SECONDS = 6; // Stellar targets ~5-6s, used only as fallback
-const SAMPLE_LEDGER_COUNT = 20;
+
 
 /**
  * Returns the average ledger close time in seconds by sampling recent ledgers.
@@ -21,8 +21,7 @@ export async function getAvgLedgerCloseSeconds(
   try {
     const latest = await server.getLatestLedger();
     const latestSeq = latest.sequence;
-    // earliestSeq is retained for future use when per-ledger close times become available
-    const _earliestSeq = Math.max(1, latestSeq - SAMPLE_LEDGER_COUNT + 1);
+    void latestSeq; // sequence retained for future per-ledger close time sampling
 
     // getLedgerEntries doesn't give us close times directly; use getEvents with
     // ledger range approach. Instead, we derive from the ledger close time fields

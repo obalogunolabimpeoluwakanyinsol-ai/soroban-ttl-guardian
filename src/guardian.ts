@@ -107,7 +107,8 @@ export class TTLGuardian {
   async extendEntry(contractId: string, key: LedgerKeyXdr | undefined, extendToDays: number): Promise<TtlExtendResult> {
     await this.refreshAvgCloseSeconds();
     const extendToLedgers = daysToLedgers(extendToDays, this.avgCloseSeconds);
-    const ledgerKey = this.buildLedgerKey(contractId, key);
+    // ledgerKey is used implicitly via prepareTransaction footprint resolution
+    void this.buildLedgerKey(contractId, key);
 
     this.logger.log('extend_attempt', { extendToDays, extendToLedgers }, contractId, key);
 
