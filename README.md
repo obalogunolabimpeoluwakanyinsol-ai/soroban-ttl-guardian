@@ -14,6 +14,14 @@ If you deploy a Soroban contract and forget about TTL, your users will eventuall
 
 ---
 
+## Why this matters
+
+This is infrastructure for developers and teams running Soroban contracts in production — it doesn't surface to end users, but they feel its absence. State archival (TTL expiry) is a Stellar/Soroban-specific design choice that affects every project built on it; this solves a problem every serious Soroban team eventually hits. Without a guardian like this, a team's app can silently break for users when contract data expires unnoticed — transactions fail, data becomes inaccessible, and the incident is hard to diagnose because nothing explicitly "deletes" anything.
+
+Think of it as ecosystem plumbing. Each team that deploys this is one fewer team filing a "my contract stopped working" post-mortem. At scale, that's a whole category of production incident eliminated across the Soroban ecosystem — a network-level benefit even though its direct users are developers, not end users.
+
+---
+
 ## Quick start
 
 ### 1. Install
@@ -132,6 +140,14 @@ The default `ConsoleNotifier` logs to stderr.
 - Restore-from-archive — if the guardian's alerts were ignored and something expired, that's a documented manual recovery path
 
 See open issues for the v2 roadmap.
+
+---
+
+## Testnet end-to-end guide
+
+For a step-by-step walkthrough of a real TTL check and extend cycle against Soroban
+testnet (including funding a fee-payer, deploying a contract, triggering an extension,
+and reading the audit log), see [`docs/testnet-dryrun.md`](docs/testnet-dryrun.md).
 
 ---
 
