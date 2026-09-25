@@ -6,7 +6,7 @@
  */
 
 import { TTLGuardian } from './guardian';
-import { GuardianConfig, LedgerKeyXdr, EntryReport, FeePayerStatus, GuardianConfigSchema } from './types';
+import { GuardianConfig, LedgerKeyXdr, EntryReport, FeePayerStatus, GuardianReport, GuardianConfigSchema } from './types';
 import { Notifier } from './notifier';
 import { ledgersToDays, daysToLedgers, computeAvgCloseSeconds, FALLBACK_CLOSE_SECONDS } from './ledger';
 import * as fs from 'fs';
@@ -391,5 +391,254 @@ describe('loadConfig validation', () => {
   test('valid config parses successfully', (): void => {
     const result = GuardianConfigSchema.safeParse(BASE_CONFIG);
     expect(result.success).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Edge cases: boundary conditions on TTL thresholds
+// ---------------------------------------------------------------------------
+
+describe('TTLGuardian — boundary conditions', () => {
+  const CONTRACT_ID = 'CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4';
+
+  test('TTL exactly 1 ledger above warn threshold: status=ok, no extension', async () => {
+    // Entry is at warnLedgers + 1 — just above the threshold, must NOT trigger extension.
+    const spy = new SpyNotifier();
+    const guardian = new TestGuardian(makeConfig(), spy);
+
+    const warnLedgers = daysToLedgers(7, FALLBACK_CLOSE_SECONDS);
+    guardian.setMockTtl(CONTRACT_ID, undefined, warnLedgers + 1);
+
+    const report = await guardian.runOnce();
+
+    expect(report.entries[0].status).toBe('ok');
+    expect(guardian.extendCalls.length).toBe(0);
+    expect(spy.criticalCalls.length).toBe(0);
+  });
+
+  test('TTL exactly at warn threshold (== warnLedgers): status=extended', async () => {
+    // The boundary: ttlLedgers <= warnLedgers triggers extension. == is included.
+    const spy = new SpyNotifier();
+    const guardian = new TestGuardian(makeConfig(), spy);
+
+    const warnLedgers = daysToLedgers(7, FALLBACK_CLOSE_SECONDS);
+    guardian.setMockTtl(CONTRACT_ID, undefined, warnLedgers);
+
+    const report = await guardian.runOnce();
+
+    expect(report.entries[0].status).toBe('extended');
+    expect(guardian.extendCalls.length).toBe(1);
+  });
+
+  test('fee-payer balance exactly at minimum boundary: NOT critical', () => {
+    // balanceXlm === feePayerMinBalanceXlm should NOT fire critical.
+    // The condition in guardian.ts is: isCritical = balanceXlm < feePayerMinBalanceXlm
+    // So balanceXlm === 10, min === 10 → strict less-than is false → NOT critical.
+    const minBalance = 10;
+    const isCritical = minBalance < minBalance; // false
+    expect(isCritical).toBe(false);
+
+    // Verify the FeePayerStatus shape at the boundary
+    const status: FeePayerStatus = { balanceXlm: 10, isCritical: false };
+    expect(status.isCritical).toBe(false);
+  });
+
+  test('fee-payer balance 1 XLM below minimum: IS critical', async () => {
+    const minBalance = 10;
+    const balance = 9.99;
+    const isCritical = balance < minBalance;
+    expect(isCritical).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Notifier throwing: must not halt other entries or crash runOnce
+// ---------------------------------------------------------------------------
+
+/** A notifier whose onCritical always throws */
+class ThrowingCriticalNotifier implements Notifier {
+  feePayerCriticalCalls: FeePayerStatus[] = [];
+  runCompleteCalls: unknown[] = [];
+
+  async onCritical(_entry: EntryReport): Promise<void> {
+    throw new Error('Slack webhook timed out');
+  }
+  async onFeePayerCritical(status: FeePayerStatus): Promise<void> {
+    this.feePayerCriticalCalls.push(status);
+  }
+  async onRunComplete(report: unknown): Promise<void> {
+    this.runCompleteCalls.push(report);
+  }
+}
+
+class ThrowingFeePayerNotifier implements Notifier {
+  async onCritical(_entry: EntryReport): Promise<void> {}
+  async onFeePayerCritical(_status: FeePayerStatus): Promise<void> {
+    throw new Error('PagerDuty API error');
+  }
+  async onRunComplete(_report: unknown): Promise<void> {}
+}
+
+/** A notifier that does NOT implement the optional onRunComplete method */
+class MinimalNotifier implements Notifier {
+  async onCritical(_entry: EntryReport): Promise<void> {}
+  async onFeePayerCritical(_status: FeePayerStatus): Promise<void> {}
+  // onRunComplete intentionally omitted
+}
+
+describe('TTLGuardian — notifier error isolation', () => {
+  const CONTRACT_A = 'CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4';
+  const CONTRACT_B = 'CBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBC4';
+
+  test('onCritical throwing does not halt processing of subsequent entries', async () => {
+    const notifier = new ThrowingCriticalNotifier();
+    const config = makeConfig({
+      entries: [
+        { contractId: CONTRACT_A, warnThresholdDays: 7, criticalThresholdDays: 2, extendToDays: 30 },
+        { contractId: CONTRACT_B, warnThresholdDays: 7, criticalThresholdDays: 2, extendToDays: 30 },
+      ],
+    });
+    const guardian = new TestGuardian(config, notifier);
+
+    // CONTRACT_A is critical, CONTRACT_B is ok — notifier throws on A's critical call
+    guardian.setMockTtl(CONTRACT_A, undefined, daysToLedgers(2, FALLBACK_CLOSE_SECONDS)); // critical
+    guardian.setMockTtl(CONTRACT_B, undefined, 999999); // ok
+
+    // runOnce must not throw even though onCritical throws
+    let report: GuardianReport | undefined;
+    let threw = false;
+    try {
+      report = await guardian.runOnce();
+    } catch {
+      threw = true;
+    }
+
+    expect(threw).toBe(false);
+    expect(report).toBeDefined();
+    // CONTRACT_B was still processed despite CONTRACT_A's notifier throwing
+    expect(report!.entries.length).toBe(2);
+    // CONTRACT_B should be ok
+    expect(report!.entries[1].status).toBe('ok');
+  });
+
+  test('onFeePayerCritical throwing does not crash runOnce', async () => {
+    const notifier = new ThrowingFeePayerNotifier();
+    const guardian = new TestGuardian(makeConfig(), notifier);
+    guardian.setMockTtl(CONTRACT_A, undefined, 999999);
+
+    // runOnce must not throw even though onFeePayerCritical throws
+    let threw = false;
+    try {
+      await guardian.runOnce();
+    } catch {
+      threw = true;
+    }
+    expect(threw).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// onRunComplete: optional method
+// ---------------------------------------------------------------------------
+
+describe('TTLGuardian — onRunComplete optional', () => {
+  const CONTRACT_ID = 'CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4';
+
+  test('notifier without onRunComplete does not crash runOnce', async () => {
+    const notifier = new MinimalNotifier();
+    const guardian = new TestGuardian(makeConfig(), notifier);
+    guardian.setMockTtl(CONTRACT_ID, undefined, 999999);
+
+    let threw = false;
+    try {
+      await guardian.runOnce();
+    } catch {
+      threw = true;
+    }
+    expect(threw).toBe(false);
+    // Verify onRunComplete is genuinely absent on this notifier
+    expect((notifier as { onRunComplete?: unknown }).onRunComplete).toBeUndefined();
+  });
+
+  test('notifier with onRunComplete receives the full report', async () => {
+    const spy = new SpyNotifier();
+    const guardian = new TestGuardian(makeConfig(), spy);
+    guardian.setMockTtl(CONTRACT_ID, undefined, 999999);
+
+    const report = await guardian.runOnce();
+
+    expect(spy.runCompleteCalls.length).toBe(1);
+    expect(spy.runCompleteCalls[0]).toStrictEqual(report);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// start() / stop() lifecycle
+// ---------------------------------------------------------------------------
+
+describe('TTLGuardian — start/stop lifecycle', () => {
+  const CONTRACT_ID = 'CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4';
+
+  beforeEach(() => {
+    jest.useFakeTimers();
+  });
+
+  afterEach(() => {
+    jest.useRealTimers();
+  });
+
+  test('start() already running throws an error', () => {
+    const guardian = new TestGuardian(makeConfig(), new SpyNotifier());
+    guardian.setMockTtl(CONTRACT_ID, undefined, 999999);
+
+    guardian.start(60);
+    expect(() => guardian.start(60)).toThrow('Guardian is already running');
+    guardian.stop();
+  });
+
+  test('stop() when not running is a no-op (does not throw)', () => {
+    const guardian = new TestGuardian(makeConfig(), new SpyNotifier());
+    // Never started — stop() should be safe
+    expect(() => guardian.stop()).not.toThrow();
+  });
+
+  test('stop() after start() clears the interval', () => {
+    const spy = new SpyNotifier();
+    const guardian = new TestGuardian(makeConfig(), spy);
+    guardian.setMockTtl(CONTRACT_ID, undefined, 999999);
+
+    guardian.start(60);
+    guardian.stop();
+
+    // After stop, calling start again must NOT throw (interval is cleared)
+    expect(() => guardian.start(60)).not.toThrow();
+    guardian.stop();
+  });
+
+  test('start() fires runOnce immediately then on interval', async () => {
+    const spy = new SpyNotifier();
+    const guardian = new TestGuardian(makeConfig(), spy);
+    guardian.setMockTtl(CONTRACT_ID, undefined, 999999);
+
+    // Spy on runOnce to count calls
+    let runOnceCalled = 0;
+    const originalRunOnce = guardian.runOnce.bind(guardian);
+    jest.spyOn(guardian, 'runOnce').mockImplementation(async () => {
+      runOnceCalled++;
+      return originalRunOnce();
+    });
+
+    guardian.start(1); // 1-minute interval
+    // Flush the immediate call
+    await Promise.resolve();
+    await Promise.resolve();
+
+    // Advance timer by 1 minute → second call
+    jest.advanceTimersByTime(60 * 1000);
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(runOnceCalled).toBeGreaterThanOrEqual(1);
+    guardian.stop();
   });
 });

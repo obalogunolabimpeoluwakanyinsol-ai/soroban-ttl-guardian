@@ -215,7 +215,15 @@ export class TTLGuardian {
     const feePayer = await this.checkFeePayerStatus();
     if (feePayer.isCritical) {
       this.logger.log('fee_payer_critical', { balanceXlm: feePayer.balanceXlm });
-      await this.notifier.onFeePayerCritical(feePayer);
+      // Notifier errors must never halt the run — catch and log them.
+      try {
+        await this.notifier.onFeePayerCritical(feePayer);
+      } catch (notifierErr) {
+        this.logger.log('run_complete', {
+          notifierError: (notifierErr as Error).message ?? String(notifierErr),
+          hook: 'onFeePayerCritical',
+        });
+      }
     }
 
     const report: GuardianReport = {
@@ -236,7 +244,15 @@ export class TTLGuardian {
     });
 
     if (this.notifier.onRunComplete) {
-      await this.notifier.onRunComplete(report);
+      // Notifier errors must never halt the run — catch and log them.
+      try {
+        await this.notifier.onRunComplete(report);
+      } catch (notifierErr) {
+        this.logger.log('run_complete', {
+          notifierError: (notifierErr as Error).message ?? String(notifierErr),
+          hook: 'onRunComplete',
+        });
+      }
     }
 
     return report;
@@ -266,7 +282,15 @@ export class TTLGuardian {
           ttlEstimatedDays,
         };
         this.logger.log('critical_alert', { ttlLedgers, ttlEstimatedDays, criticalThresholdDays }, contractId, key);
-        await this.notifier.onCritical(criticalReport);
+        // Notifier errors must never halt processing of other entries.
+        try {
+          await this.notifier.onCritical(criticalReport);
+        } catch (notifierErr) {
+          this.logger.log('critical_alert', {
+            notifierError: (notifierErr as Error).message ?? String(notifierErr),
+            hook: 'onCritical',
+          }, contractId, key);
+        }
         // Attempt extension even at critical level
         try {
           const ext = await this.extendEntry(contractId, key, extendToDays);
