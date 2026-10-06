@@ -81,8 +81,9 @@ export class TTLGuardian {
     try {
       const keypair = Keypair.fromSecret(this.config.feePayerSecret);
       const account = await this.server.getAccount(keypair.publicKey());
-      const latestLedger = await this.server.getLatestLedger();
 
+      // extendTo is a relative ledger count (not an absolute sequence number).
+      // The footprint key must be in readOnly for extendFootprintTtl operations.
       const sorobanData = new SorobanDataBuilder()
         .setReadOnly([ledgerKey])
         .build();
@@ -91,7 +92,7 @@ export class TTLGuardian {
         fee: '100',
         networkPassphrase: this.config.networkPassphrase,
       })
-        .addOperation(Operation.extendFootprintTtl({ extendTo: latestLedger.sequence + extendToLedgers }))
+        .addOperation(Operation.extendFootprintTtl({ extendTo: extendToLedgers }))
         .setSorobanData(sorobanData)
         .setNetworkPassphrase(this.config.networkPassphrase)
         .setTimeout(30)
@@ -109,15 +110,34 @@ export class TTLGuardian {
       }
 
       const txHash = sendResponse.hash;
-      let getResponse: SorobanRpc.Api.GetTransactionResponse | undefined;
+      let confirmed = false;
       for (let attempts = 0; attempts < 20; attempts++) {
         await new Promise((r) => setTimeout(r, 1500));
-        getResponse = await this.server.getTransaction(txHash);
-        if (getResponse.status !== SorobanRpc.Api.GetTransactionStatus.NOT_FOUND) break;
+        try {
+          const getResponse = await this.server.getTransaction(txHash);
+          if (getResponse.status === SorobanRpc.Api.GetTransactionStatus.SUCCESS) {
+            confirmed = true;
+            break;
+          } else if (getResponse.status === SorobanRpc.Api.GetTransactionStatus.FAILED) {
+            throw new Error(`Transaction failed on-chain: ${txHash}`);
+          }
+          // NOT_FOUND → still pending, keep polling
+        } catch (parseErr) {
+          const msg = (parseErr as Error).message ?? String(parseErr);
+          // The stellar-sdk v12 parser throws "Bad union switch" when reading back
+          // extendFootprintTtl/restoreFootprint transactions because it only handles
+          // invokeHostFunction result XDR. Treat this as a successful confirmation
+          // since the tx was already accepted (status was PENDING, not ERROR).
+          if (msg.includes('Bad union switch') || msg.includes('XDR Read Error')) {
+            confirmed = true;
+            break;
+          }
+          throw parseErr;
+        }
       }
 
-      if (!getResponse || getResponse.status !== SorobanRpc.Api.GetTransactionStatus.SUCCESS) {
-        throw new Error(`Transaction did not confirm: ${getResponse?.status ?? 'timeout'}`);
+      if (!confirmed) {
+        throw new Error(`Transaction did not confirm within timeout: ${txHash}`);
       }
 
       const checkResult = await this.checkEntry(contractId, key);

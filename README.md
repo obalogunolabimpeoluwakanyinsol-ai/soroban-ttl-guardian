@@ -97,7 +97,7 @@ If `keys` is omitted, only the contract instance TTL is watched. If `keys` is pr
 
 ## Design decisions
 
-**TTL is always computed in ledgers, never wall-clock time.** The guardian converts your human-configured day thresholds to ledger counts using a periodically-recomputed average ledger close time — never a hardcoded constant. This prevents silent drift if Stellar's close time changes.
+**TTL is always computed in ledgers, never wall-clock time.** The guardian converts your human-configured day thresholds to ledger counts using the `ledgerCloseSeconds` value from config (default 5 s, matching Stellar mainnet). This prevents silent drift if Stellar's close time changes — update the config value to recalibrate.
 
 **Skip-if-above-threshold.** If an entry's current TTL is already above the warn threshold, the guardian skips it and doesn't spend fees on a redundant extension. The ledger-count threshold check is the guard.
 

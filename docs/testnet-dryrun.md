@@ -1,8 +1,11 @@
 # Testnet Dry-Run: TTL Check/Extend Cycle
 
-This document walks through a real end-to-end TTL check and extend cycle against Soroban
-testnet. No code changes required — this uses the `ttl-guardian` CLI against a live
-testnet contract.
+This document records a real end-to-end TTL check and extend cycle against Soroban
+testnet run on **2026-10-06**.
+
+> **Testnet resets**: Stellar testnet resets periodically. The contract ID, transaction
+> hashes, and ledger numbers below come from a specific run and will not be queryable
+> after the next reset. The commands and procedure remain valid; only the values change.
 
 > **Prerequisites**
 > - `npm install && npm run build` in the repo root
@@ -16,41 +19,49 @@ testnet contract.
 
 ```bash
 # Generate a throwaway keypair for testnet
-stellar keys generate --network testnet testnet-feepayer
-stellar keys address testnet-feepayer
-
-# Fund it via the friendbot
-curl "https://friendbot.stellar.org?addr=$(stellar keys address testnet-feepayer)"
+stellar keys generate alice --network testnet --fund
+stellar keys address alice
+stellar keys show alice
 ```
 
-Get the secret key:
-```bash
-stellar keys show testnet-feepayer
-# prints: S... (keep this secret)
+The `--fund` flag calls the friendbot automatically. Output:
+
+```
+✅ Key saved with alias alice in "/home/codespace/.config/stellar/identity/alice.toml"
+✅ Account alice funded on "Test SDF Network ; September 2015"
+GDYT52IOLRSAHSMXBUB7Q2NXY4D2PBAPEY5QQRLMOZSOUVBB3CM3UBXC
+S... (secret key — keep this safe)
 ```
 
 ---
 
-## 2. Deploy a minimal Soroban contract (optional)
-
-If you don't have a contract already, deploy the soroban hello-world example:
+## 2. Deploy a minimal Soroban contract
 
 ```bash
-# Install stellar CLI if not already present
-cargo install stellar-cli --features opt
+# Initialise a hello-world contract workspace
+stellar contract init hello
+cd hello
 
-# Clone and build the hello-world contract
-git clone https://github.com/stellar/soroban-examples.git
-cd soroban-examples/hello_world
-cargo build --target wasm32-unknown-unknown --release
+# Build (requires wasm32v1-none target: rustup target add wasm32v1-none)
+stellar contract build
 
-# Deploy to testnet (replace S... with your testnet-feepayer secret)
+# Deploy to testnet
 stellar contract deploy \
-  --wasm target/wasm32-unknown-unknown/release/soroban_hello_world_contract.wasm \
-  --source S... \
+  --wasm target/wasm32v1-none/release/hello_world.wasm \
+  --source-account alice \
   --network testnet
-# Output: C... (contract ID — save this)
 ```
+
+Output:
+
+```
+ℹ️  Uploading contract WASM…
+ℹ️  Deploying contract using wasm hash 2fb32174195f57d9d0e0d3c5f5474cdff027bc63fa7a7f9d6cca0f9b70340db3
+✅ Deployed!
+CCW3TIAXD6LQXOZPQFJOZOXKNRIQRAVSNT6EWG5QYCNEL6TZTBI3PHCZ
+```
+
+Contract ID: `CCW3TIAXD6LQXOZPQFJOZOXKNRIQRAVSNT6EWG5QYCNEL6TZTBI3PHCZ`
 
 ---
 
@@ -61,148 +72,134 @@ stellar contract deploy \
   "rpcUrl": "https://soroban-testnet.stellar.org",
   "networkPassphrase": "Test SDF Network ; September 2015",
   "feePayerSecret": "S...",
-  "feePayerMinBalanceXlm": 1,
-  "logFile": "/tmp/testnet-ttl.log",
+  "feePayerMinBalanceXlm": 10,
+  "logFile": "ttl-guardian.log",
   "entries": [
     {
-      "contractId": "C...",
-      "warnThresholdDays": 60,
-      "criticalThresholdDays": 10,
-      "extendToDays": 120
+      "contractId": "CCW3TIAXD6LQXOZPQFJOZOXKNRIQRAVSNT6EWG5QYCNEL6TZTBI3PHCZ",
+      "warnThresholdDays": 7,
+      "criticalThresholdDays": 2,
+      "extendToDays": 30
     }
   ]
 }
 ```
 
-Save this as `testnet-config.json`.
+Save as `config.json`.
 
 ---
 
-## 4. Check the current TTL
+## 4. Check the current TTL (before extend)
 
 ```bash
-./node_modules/.bin/ts-node src/cli.ts check \
-  --config testnet-config.json \
-  --contract C...
+node dist/cli.js check \
+  --config config.json \
+  --contract CCW3TIAXD6LQXOZPQFJOZOXKNRIQRAVSNT6EWG5QYCNEL6TZTBI3PHCZ
 ```
 
-Expected output (values will vary):
+Real output from 2026-10-06:
+
 ```json
 {
-  "contractId": "C...",
-  "key": undefined,
+  "contractId": "CCW3TIAXD6LQXOZPQFJOZOXKNRIQRAVSNT6EWG5QYCNEL6TZTBI3PHCZ",
+  "ttlLedgers": 120926,
+  "ttlEstimatedDays": 6.998032407407408
+}
+```
+
+The freshly deployed contract had ~7 days of TTL remaining — right at the warn
+threshold configured above.
+
+---
+
+## 5. Extend the TTL to 30 days
+
+```bash
+node dist/cli.js extend \
+  --config config.json \
+  --contract CCW3TIAXD6LQXOZPQFJOZOXKNRIQRAVSNT6EWG5QYCNEL6TZTBI3PHCZ \
+  --days 30
+```
+
+Real output from 2026-10-06:
+
+```json
+{
+  "contractId": "CCW3TIAXD6LQXOZPQFJOZOXKNRIQRAVSNT6EWG5QYCNEL6TZTBI3PHCZ",
+  "txHash": "f95199b14ed884edfa96d577abb1831389c294a092210d0aa239df77b4ad755e",
+  "newTtlLedgers": 518400
+}
+```
+
+Transaction confirmed on-chain:
+- Explorer: https://stellar.expert/explorer/testnet/tx/f95199b14ed884edfa96d577abb1831389c294a092210d0aa239df77b4ad755e
+
+---
+
+## 6. Check the TTL again (after extend)
+
+```bash
+node dist/cli.js check \
+  --config config.json \
+  --contract CCW3TIAXD6LQXOZPQFJOZOXKNRIQRAVSNT6EWG5QYCNEL6TZTBI3PHCZ
+```
+
+Real output from 2026-10-06:
+
+```json
+{
+  "contractId": "CCW3TIAXD6LQXOZPQFJOZOXKNRIQRAVSNT6EWG5QYCNEL6TZTBI3PHCZ",
   "ttlLedgers": 518400,
-  "ttlEstimatedDays": 36.0
+  "ttlEstimatedDays": 30
 }
 ```
 
-> `ttlLedgers` is the raw ledger count remaining. `ttlEstimatedDays` converts that to
-> wall-clock days using the current average ledger close time (~6 seconds on testnet).
-
----
-
-## 5. Run a full check cycle
-
-```bash
-./node_modules/.bin/ts-node src/cli.ts run \
-  --config testnet-config.json
-```
-
-If the TTL is above `warnThresholdDays` (60 days in this config), you'll see:
-```json
-{
-  "timestamp": "2025-01-01T00:00:00.000Z",
-  "entries": [
-    {
-      "contractId": "C...",
-      "key": null,
-      "status": "ok",
-      "ttlLedgers": 518400,
-      "ttlEstimatedDays": 36.0
-    }
-  ],
-  "feePayer": { "balanceXlm": 9800.0, "isCritical": false },
-  "checkedCount": 1,
-  "extendedCount": 0,
-  "criticalCount": 0,
-  "errorCount": 0
-}
-```
-
----
-
-## 6. Force an extension by lowering the warn threshold
-
-Temporarily lower `warnThresholdDays` above the current TTL in days to trigger an
-actual on-chain extension:
-
-```json
-{
-  "entries": [
-    {
-      "contractId": "C...",
-      "warnThresholdDays": 999,
-      "criticalThresholdDays": 10,
-      "extendToDays": 1000
-    }
-  ]
-}
-```
-
-Then re-run:
-```bash
-./node_modules/.bin/ts-node src/cli.ts run \
-  --config testnet-config-extend.json
-```
-
-Expected output:
-```json
-{
-  "entries": [
-    {
-      "contractId": "C...",
-      "status": "extended",
-      "ttlLedgers": 518400,
-      "ttlEstimatedDays": 36.0,
-      "extension": {
-        "contractId": "C...",
-        "txHash": "abc123...",
-        "newTtlLedgers": 14400000
-      }
-    }
-  ],
-  "extendedCount": 1
-}
-```
-
-The transaction hash is a real, confirmed Soroban transaction on testnet. You can verify
-it on the [Stellar Explorer](https://stellar.expert/explorer/testnet).
+TTL extended from ~7 days to exactly 30 days (518 400 ledgers at 5 s/ledger).
 
 ---
 
 ## 7. Inspect the audit log
 
 ```bash
-cat /tmp/testnet-ttl.log
+cat ttl-guardian.log
 ```
 
-Each line is an NDJSON log entry:
+Each line is an NDJSON log entry. After the check/extend/check cycle above:
+
 ```
-{"timestamp":"2025-01-01T00:00:00.000Z","event":"check","contractId":"C...","detail":{"ttlLedgers":518400,"ttlEstimatedDays":36.0}}
-{"timestamp":"2025-01-01T00:00:00.100Z","event":"extend_attempt","contractId":"C...","detail":{"extendToDays":1000,"extendToLedgers":14400000}}
-{"timestamp":"2025-01-01T00:00:04.200Z","event":"extend_success","contractId":"C...","detail":{"txHash":"abc123...","newTtlLedgers":14400000}}
-{"timestamp":"2025-01-01T00:00:04.201Z","event":"run_complete","detail":{"checkedCount":1,"extendedCount":1,"criticalCount":0,"errorCount":0}}
+{"timestamp":"2026-10-06T21:24:...Z","event":"check","contractId":"CCW3TIAXD6LQXOZPQFJOZOXKNRIQRAVSNT6EWG5QYCNEL6TZTBI3PHCZ","detail":{"ttlLedgers":120926,"ttlEstimatedDays":6.998032407407408,"expirationLedger":5180464,"latestLedger":5059538}}
+{"timestamp":"2026-10-06T21:24:...Z","event":"extend_attempt","contractId":"CCW3TIAXD6LQXOZPQFJOZOXKNRIQRAVSNT6EWG5QYCNEL6TZTBI3PHCZ","detail":{"extendToDays":30,"extendToLedgers":518400}}
+{"timestamp":"2026-10-06T21:24:...Z","event":"check","contractId":"CCW3TIAXD6LQXOZPQFJOZOXKNRIQRAVSNT6EWG5QYCNEL6TZTBI3PHCZ","detail":{"ttlLedgers":120926,"ttlEstimatedDays":6.998032407407408,"expirationLedger":5180464,"latestLedger":5059538}}
+{"timestamp":"2026-10-06T21:25:...Z","event":"extend_success","contractId":"CCW3TIAXD6LQXOZPQFJOZOXKNRIQRAVSNT6EWG5QYCNEL6TZTBI3PHCZ","detail":{"txHash":"f95199b14ed884edfa96d577abb1831389c294a092210d0aa239df77b4ad755e","newTtlLedgers":518400}}
 ```
 
 ---
 
 ## What this demonstrates
 
-- `checkEntry` fetches the live ledger entry from Soroban RPC and returns the real TTL
-- `extendEntry` builds, signs, submits, and confirms an `ExtendFootprintTtl` operation
-- The average ledger close time is computed from real observed ledger data — not hardcoded
-- The append-only log captures every event for audit purposes
-- Fee-payer balance is checked against the configured minimum every run
+- `check` fetches the live ledger entry from Soroban RPC and returns the real TTL in
+  ledgers and estimated days
+- `extend` builds, signs, submits, and confirms an `ExtendFootprintTtl` operation with
+  a relative ledger count (`extendTo: 518400`) and the contract instance key in the
+  read-only footprint
+- The append-only NDJSON log captures every event for audit purposes
+- Fee-payer balance is checked against the configured minimum on every `run` cycle
 
 This is the same code path used in production. The only difference between this dry-run
 and a real deployment is the config values and the contract being watched.
+
+### Notes on the `extendFootprintTtl` operation
+
+Two non-obvious protocol requirements surfaced during this dry-run and are now covered
+by regression tests:
+
+1. The `extendTo` field in `ExtendFootprintTtlOp` is a **relative ledger count** (how
+   many ledgers to extend *by*), not an absolute ledger sequence number. Passing an
+   absolute value produces `extendFootprintTtlMalformed` on-chain.
+2. The footprint key must be in the **read-only** set, not read-write. This is the
+   opposite of what you might expect for a write operation, but it is what the protocol
+   and the stellar CLI both require.
+
+See `src/guardian.test.ts` — describe block
+`extendEntry regression — footprint is read-only and extendTo is relative` — for the
+tests that lock in both invariants.
