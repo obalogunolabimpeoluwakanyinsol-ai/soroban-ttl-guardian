@@ -1,6 +1,7 @@
 import {
   SorobanRpc,
   TransactionBuilder,
+  SorobanDataBuilder,
   Keypair,
   Operation,
   xdr,
@@ -19,16 +20,9 @@ import {
 import { Notifier, ConsoleNotifier } from './notifier';
 import { Logger } from './logger';
 import {
-  FALLBACK_CLOSE_SECONDS,
-  computeAvgCloseSeconds,
   ledgersToDays,
   daysToLedgers,
 } from './ledger';
-
-interface LedgerSnapshot {
-  sequence: number;
-  closeTime: number;
-}
 
 export class TTLGuardian {
   protected readonly config: GuardianConfig;
@@ -36,39 +30,14 @@ export class TTLGuardian {
   protected readonly logger: Logger;
   protected readonly server: SorobanRpc.Server;
   private intervalHandle: ReturnType<typeof setInterval> | null = null;
-  private prevLedger: LedgerSnapshot | null = null;
-  protected avgCloseSeconds: number = FALLBACK_CLOSE_SECONDS;
+  protected readonly avgCloseSeconds: number;
 
   constructor(config: GuardianConfig, notifier: Notifier = new ConsoleNotifier()) {
     this.config = config;
     this.notifier = notifier;
     this.logger = new Logger(config.logFile);
     this.server = new SorobanRpc.Server(config.rpcUrl);
-  }
-
-  protected async refreshAvgCloseSeconds(): Promise<void> {
-    try {
-      const latest = await this.server.getLatestLedger();
-      const nowSeconds = Math.floor(Date.now() / 1000);
-      const curr: LedgerSnapshot = {
-        sequence: latest.sequence,
-        closeTime: nowSeconds,
-      };
-      if (this.prevLedger !== null) {
-        const computed = computeAvgCloseSeconds(
-          this.prevLedger.sequence,
-          this.prevLedger.closeTime,
-          curr.sequence,
-          curr.closeTime,
-        );
-        if (computed >= 1 && computed <= 30) {
-          this.avgCloseSeconds = computed;
-        }
-      }
-      this.prevLedger = curr;
-    } catch {
-      // Keep last known value
-    }
+    this.avgCloseSeconds = config.ledgerCloseSeconds;
   }
 
   protected buildLedgerKey(contractId: string, key?: LedgerKeyXdr): xdr.LedgerKey {
@@ -89,7 +58,6 @@ export class TTLGuardian {
   }
 
   async checkEntry(contractId: string, key?: LedgerKeyXdr): Promise<TtlCheckResult> {
-    await this.refreshAvgCloseSeconds();
     const ledgerKey = this.buildLedgerKey(contractId, key);
     const response = await this.server.getLedgerEntries(ledgerKey);
     if (response.entries.length === 0) {
@@ -105,10 +73,8 @@ export class TTLGuardian {
   }
 
   async extendEntry(contractId: string, key: LedgerKeyXdr | undefined, extendToDays: number): Promise<TtlExtendResult> {
-    await this.refreshAvgCloseSeconds();
     const extendToLedgers = daysToLedgers(extendToDays, this.avgCloseSeconds);
-    // ledgerKey is used implicitly via prepareTransaction footprint resolution
-    void this.buildLedgerKey(contractId, key);
+    const ledgerKey = this.buildLedgerKey(contractId, key);
 
     this.logger.log('extend_attempt', { extendToDays, extendToLedgers }, contractId, key);
 
@@ -117,17 +83,25 @@ export class TTLGuardian {
       const account = await this.server.getAccount(keypair.publicKey());
       const latestLedger = await this.server.getLatestLedger();
 
+      const sorobanData = new SorobanDataBuilder()
+        .setReadOnly([ledgerKey])
+        .build();
+
       const tx = new TransactionBuilder(account, {
         fee: '100',
         networkPassphrase: this.config.networkPassphrase,
       })
         .addOperation(Operation.extendFootprintTtl({ extendTo: latestLedger.sequence + extendToLedgers }))
+        .setSorobanData(sorobanData)
         .setNetworkPassphrase(this.config.networkPassphrase)
         .setTimeout(30)
         .build();
 
       const preparedTx = await this.server.prepareTransaction(tx);
       preparedTx.sign(keypair);
+
+      const checkBefore = await this.checkEntry(contractId, key);
+      const ttlBefore = checkBefore.ttlLedgers;
 
       const sendResponse = await this.server.sendTransaction(preparedTx);
       if (sendResponse.status === 'ERROR') {
@@ -147,7 +121,11 @@ export class TTLGuardian {
       }
 
       const checkResult = await this.checkEntry(contractId, key);
-      this.logger.log('extend_success', { txHash, newTtlLedgers: checkResult.ttlLedgers }, contractId, key);
+      if (checkResult.ttlLedgers > ttlBefore) {
+        this.logger.log('extend_success', { txHash, newTtlLedgers: checkResult.ttlLedgers }, contractId, key);
+      } else {
+        this.logger.log('extend_failure', { txHash, reason: 'TTL did not increase', newTtlLedgers: checkResult.ttlLedgers, ttlBefore }, contractId, key);
+      }
       return { contractId, key, txHash, newTtlLedgers: checkResult.ttlLedgers };
     } catch (err) {
       const message = (err as Error).message ?? String(err);
@@ -162,19 +140,23 @@ export class TTLGuardian {
    * (separate from TTL-critical alerts), ensuring operators get a clear signal that
    * the extension mechanism itself is at risk.
    *
-   * Uses getAccount() to fetch the account record, then parses the native XLM balance
-   * from the balances array.
+   * Reads the native XLM balance from the account's ledger entry (AccountEntry.balance,
+   * denominated in stroops) via getLedgerEntries.
    */
   private async checkFeePayerStatus(): Promise<FeePayerStatus> {
     try {
       const keypair = Keypair.fromSecret(this.config.feePayerSecret);
       const publicKey = keypair.publicKey();
-      const account = await this.server.getAccount(publicKey);
-      // getAccount returns an AccountResponse with a balances array
-      type Balance = { asset_type: string; balance: string };
-      const accountAny = account as unknown as { balances: Balance[] };
-      const nativeBalance = accountAny.balances?.find((b) => b.asset_type === 'native');
-      const balanceXlm = nativeBalance ? parseFloat(nativeBalance.balance) : 0;
+      const accountKey = xdr.LedgerKey.account(
+        new xdr.LedgerKeyAccount({ accountId: Keypair.fromPublicKey(publicKey).xdrPublicKey() }),
+      );
+      const response = await this.server.getLedgerEntries(accountKey);
+      if (response.entries.length === 0) {
+        return { balanceXlm: 0, isCritical: true };
+      }
+      // balance is in stroops (1 XLM = 10_000_000 stroops)
+      const balanceStroops = response.entries[0].val.account().balance();
+      const balanceXlm = Number(balanceStroops) / 10_000_000;
       const isCritical = balanceXlm < this.config.feePayerMinBalanceXlm;
       return { balanceXlm, isCritical };
     } catch {

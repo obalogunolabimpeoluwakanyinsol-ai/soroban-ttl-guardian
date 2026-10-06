@@ -66,6 +66,9 @@ export const GuardianConfigSchema = z.object({
   feePayerSecret: z.string().min(1),
   /** Minimum fee-payer XLM balance before a low-balance critical alert fires */
   feePayerMinBalanceXlm: z.number().positive().default(10),
+  /** Assumed ledger close time in seconds used to convert days ↔ ledgers.
+   *  Defaults to 5 s (Stellar mainnet target). Override for testnet or custom networks. */
+  ledgerCloseSeconds: z.number().positive().default(5),
   /** Entries to watch */
   entries: z.array(WatchEntrySchema).min(1),
   /** Path to the append-only log file */
